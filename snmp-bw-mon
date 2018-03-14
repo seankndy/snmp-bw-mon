@@ -1,0 +1,330 @@
+#!/usr/bin/php
+<?php
+/*
+ * monitors interface bandwidth via snmp and optionally latency to a given host
+ *   requires bcmath and snmp libs (snmp lib optional if $useSnmpGetBin = true
+ *   and snmpget is installed on machine)
+ * author: sean kennedy <sean@kndy.net>
+ *
+ */
+
+date_default_timezone_set('America/Denver');
+$useSnmpGetBin = false; // use 'snmpget' binary instead of snmp php lib
+
+$graphColors = ['48C4EC', 'EA644A', 'ff0000'];
+$graphIterations = 5; // output to graph PNG ever x iterations
+
+$options = getopt("v:p:r:a:c:x:i:t:hl");
+if (!$options || isset($options['h'])) {
+	usage();
+}
+
+if (isset($options['a']) && isset($options['c']) && isset($options['x'])) {
+	$ip = $options['a'];
+	$snmpCommunity = $options['c'];
+	$ifIdx = $options['x'];
+} else {
+	usage();
+}
+
+$inMib = isset($options['l']) ? "ifInOctets.$ifIdx" : "ifHCInOctets.$ifIdx";
+$outMib = isset($options['l']) ? "ifOutOctets.$ifIdx" : "ifHCOutOctets.$ifIdx";
+$snmpVersion = isset($options['v']) ? $options['v'] : '2c';
+$minPrintRate = (isset($options['t'])) ? humanSizeToBytes($options['t']) : 0;
+$interval = (isset($options['i']) && $options['i'] >= 1) ? $options['i'] : 1;
+$pingHost = isset($options['p']) ? $options['p'] : null;
+$rrdDir = isset($options['r']) ? $options['r'] : null;
+
+$rrdFile = str_replace('.', '-', $ip) . '-' . $ifIdx . '.rrd';
+if ($rrdDir) {
+	if (!is_dir($rrdDir) || !is_writable($rrdDir)) {
+		die("error: directory for RRD storage ($rrdDir) is either non-existant or not writable.\n");
+	}
+	
+	if (!file_exists($rrdDir.'/'.$rrdFile)) {
+		$cmd = "rrdtool create $rrdDir/$rrdFile --start now-{$interval}s --step $interval ";
+		
+		$daily = "1:" . (86400 / $interval);
+		$weekly = "6:" . (((86400*7) / $interval)/($interval * 6));
+		$monthly = "24:" . (((86400*30) / $interval)/($interval * 24));
+		$yearly = "144:" . (((86400*365) / $interval)/($interval * 144));	
+		
+		$cmd .= "DS:inoctets:COUNTER:" . ($interval*2) . ":U:U ";
+		$cmd .= "DS:outoctets:COUNTER:" . ($interval*2) . ":U:U ";
+		$cmd .= "DS:rtt:GAUGE:" . ($interval*2) . ":U:U ";
+		
+		$cmd .= "RRA:MIN:0.5:$daily ";
+		$cmd .= "RRA:MIN:0.5:$weekly ";
+		$cmd .= "RRA:MIN:0.5:$monthly ";
+		$cmd .= "RRA:MIN:0.5:$yearly ";
+		$cmd .= "RRA:AVERAGE:0.5:$daily ";
+		$cmd .= "RRA:AVERAGE:0.5:$weekly ";
+		$cmd .= "RRA:AVERAGE:0.5:$monthly ";
+		$cmd .= "RRA:AVERAGE:0.5:$yearly ";
+		$cmd .= "RRA:MAX:0.5:$daily ";
+		$cmd .= "RRA:MAX:0.5:$weekly ";
+		$cmd .= "RRA:MAX:0.5:$monthly ";
+		$cmd .= "RRA:MAX:0.5:$yearly ";
+			
+		system($cmd, $retval);
+	}
+}
+
+echo "Starting (interval=$interval; ip=$ip; snmp-community=$snmpCommunity; ifIndex=$ifIdx; min-print-rate=" .
+	dataRateFormatter($minPrintRate) . ", ping-host=$pingHost), press CTRL+C to stop...\n";
+
+if ($pingHost) {
+	printf("%-25s %-30s %25s\n", "Time", "Utilization (in/out)", "RTT to $pingHost");
+	echo str_repeat("-", 82) . "\n";
+} else {
+	printf("%-25s %-30s\n", "Time", "Utilization (in/out)");
+	echo str_repeat("-", 56) . "\n";
+}
+
+$fpingCmd = "fping -C1 -t 300 -q $pingHost 2>&1";
+$snmpgetCmd = "snmpget -v$snmpVersion -c $snmpCommunity $ip %s";
+$lastOutVal = $lastInVal = $lastTs = null;
+for ($i = 0; true; $i++) {
+	$startTs = microtime(true);
+	if ($useSnmpGetBin) {
+		$snmpOutputIn = trim(exec(sprintf($snmpgetCmd, $inMib)));
+		$snmpOutputOut = trim(exec(sprintf($snmpgetCmd, $outMib)));
+	} else {
+		if ($snmpVersion == '1') {
+			$snmpOutputIn = snmpget($ip, $snmpCommunity, $inMib, 700000, 0);
+			$snmpOutputOut = snmpget($ip, $snmpCommunity, $outMib, 700000, 0);
+		} else {
+			$snmpOutputIn = snmp2_get($ip, $snmpCommunity, $inMib, 700000, 0);
+			$snmpOutputOut = snmp2_get($ip, $snmpCommunity, $outMib, 700000, 0);
+		}
+		if ($snmpOutputIn == false || $snmpOutputOut == false) {
+			$lastVal = $lastTs = null;
+			echo "error: snmp get failed, check passed-in ip/community/mib\n";
+			sleep($interval);
+			continue;
+		}
+	}
+	
+	$endTs = $bodyStartTs = microtime(true);
+	$ts = ($startTs + $endTs)/2.0; // get center time
+	list($inType, $inVal) = explode(": ", $snmpOutputIn);
+	list($outType, $outVal) = explode(": ", $snmpOutputOut);
+	
+	if ($lastInVal !== null) {
+		$v = $inVal;
+		if (bccomp($lastInVal, $v) == 1) { // lastInVal > v = counter rolled
+			if ($inType == 'Counter64') {
+				$maxVal = bcsub(bcpow('2', '64'), 1);
+			} else {
+				$maxVal = bcsub(bcpow('2', '32'), 1);
+			}
+			$v = bcadd(bcsub($maxVal, $lastInVal), $v);
+			$lastInVal = 0;
+		}
+		
+		$inRate = bcdiv(bcsub($v, $lastInVal), bcsub($ts, $lastTs));
+	}
+	if ($lastOutVal !== null) {
+		$v = $outVal;
+		if (bccomp($lastOutVal, $v) == 1) { // lastOutVal > v = counter rolled
+			if ($outType == 'Counter64') {
+				$maxVal = bcsub(bcpow('2', '64'), 1);
+			} else {
+				$maxVal = bcsub(bcpow('2', '32'), 1);
+			}
+			$v = bcadd(bcsub($maxVal, $lastOutVal), $v);
+			$lastOutVal = 0;
+		}
+		
+		$outRate = bcdiv(bcsub($v, $lastOutVal), bcsub($ts, $lastTs));
+
+	}
+	
+	$rtt = 0;
+	if ($pingHost) {
+		$pingOutput = trim(exec($fpingCmd));
+		$rtt = explode(" : ", $pingOutput)[1];
+	}
+	if ($lastInVal && $lastOutVal && ($minPrintRate == 0 || ($inRate >= $minPrintRate || $outRate >= $minPrintRate))) {
+		$d = date("m/d/Y H:i:s", $ts);
+		$fmtInRate = dataRateFormatter($inRate);
+		$fmtOutRate = dataRateFormatter($outRate);
+		if ($pingHost) {
+			printf("%-25s %-30s %25s\n", (($rrdDir && $i > 0 && $i % $graphIterations == 0) ? "*" : "") . $d, "$fmtInRate/$fmtOutRate", "$rtt ms");
+		} else {
+			printf("%-25s %-30s\n", (($rrdDir && $i > 0 && $i % 10 == 0) ? "*" : "") . $d, "$fmtInRate/$fmtOutRate");
+		}
+	}
+	
+	if ($rrdDir) {
+		$cmd = "rrdtool update $rrdDir/$rrdFile N:$inVal:$outVal:" . ($rtt == '-' ? 0 : $rtt);
+		//echo "$cmd\n";
+		system($cmd, $retval);
+	}
+	
+	// every $graphIterations iterations, update graph images
+	if ($rrdDir && $i > 0 && $i % $graphIterations == 0) {
+		foreach (['daily' => '1d','weekly' => '7d','monthly' => '30d','yearly' => '365d'] as $timeline => $days) {
+			$scale = null;
+			if ($pingHost) {
+				// determine graph scale
+				$scale = trim(exec("VALS=`rrdtool graph /dev/null --start now-$days DEF:input=$rrdDir/$rrdFile:inoctets:AVERAGE DEF:output=$rrdDir/$rrdFile:outoctets:AVERAGE DEF:latency=$rrdDir/$rrdFile:rtt:AVERAGE VDEF:maxlatency=latency,MAXIMUM CDEF:inbps=input,8,\* CDEF:outbps=output,8,\* CDEF:largestbps=output,input,GT,output,input,IF VDEF:maxbps=largestbps,MAXIMUM PRINT:maxlatency:\"%.20lf\" PRINT:maxbps:\"%.20lf\" | sed 1d`; echo \$VALS | awk '{print \$2/\$1}'"));
+			}
+			
+			$gc = $graphColors;
+			
+			$cmd = "rrdtool graph $rrdDir/" . basename($rrdFile, '.rrd') . "-$timeline.png -c CANVAS#000000 -c FONT#FFFFFF -c BACK#000000 --width 650 --height 400 --border 0 --start now-$days ";
+			if ($pingHost) {
+				$cmd .= "-t \"in/out utilization for $ip, ifidx $ifIdx - RTT to $pingHost\" ";
+				$cmd .= "-v \"msec\" ";
+				$cmd .= "--right-axis $scale:0 ";
+				$cmd .= "--right-axis-label \"bits/sec\" ";
+			} else {
+				$cmd .= "-t \"in/out utilization for $ip, ifidx $ifIdx\" ";
+				$cmd .= "-v \"bits/sec\" ";
+			}
+			
+			$clr = array_shift($gc);
+			$cmd .= "DEF:inoctets=$rrdDir/$rrdFile:inoctets:AVERAGE ";
+			$cmd .= "CDEF:inbps=inoctets,8,\* ";
+			if ($scale) {
+				$cmd .= "CDEF:sinbps=inbps,$scale,/ ";
+				$cmd .= "AREA:sinbps#00" . $clr . ":Input ";
+			} else {
+				$cmd .= "AREA:inbps#00" . $clr . ":Input ";
+			}
+			$cmd .= "GPRINT:inbps:LAST:\"Last\: %5.2lf%s\" ";
+			$cmd .= "COMMENT:\"\\n\" ";
+			
+			$clr = array_shift($gc);
+			$cmd .= "DEF:outoctets=$rrdDir/$rrdFile:outoctets:AVERAGE ";
+			$cmd .= "CDEF:outbps=outoctets,8,\* ";
+			if ($scale) {
+				$cmd .= "CDEF:soutbps=outbps,$scale,/ ";
+				$cmd .= "AREA:soutbps#00" . $clr . ":Output ";
+			} else {
+				$cmd .= "AREA:outbps#00" . $clr . ":Output ";
+			}
+			$cmd .= "GPRINT:outbps:LAST:\"Last\: %5.2lf%s\" ";
+			$cmd .= "COMMENT:\"\\n\" ";
+			
+			if ($pingHost) {
+				$clr = array_shift($gc);
+				$cmd .= "DEF:latency=$rrdDir/$rrdFile:rtt:AVERAGE ";
+				$cmd .= "LINE1:latency#" . $clr . ":Latency ";
+				$cmd .= "GPRINT:latency:LAST:\"Last\: %5.2lf%s\" ";
+				$cmd .= "COMMENT:\"\\n\" ";
+			}
+			
+			$cmd .= " > /dev/null 2>&1";
+			//echo "$cmd\n\n";
+			system($cmd, $retval);
+		}
+	}
+	
+	$lastInVal = $inVal;
+	$lastOutVal = $outVal;
+	$lastTs = $ts;
+	
+	$bodyEndTs = microtime(true);
+	usleep(($interval-($bodyEndTs-$bodyStartTs))*1000000);
+}
+
+function dataRateFormatter($octets)
+{
+	$bps = $octets*8;
+	if (bccomp($bps, '1000') == -1) {
+		return "$bps bps";
+	} else if (bccomp($bps, '1000000000000') >= 0) {
+		return bcdiv($bps, '1000000000000', 2) . " Tbps";
+	} else if (bccomp($bps, '1000000000') >= 0) {
+		return bcdiv($bps, '1000000000', 2) . " Gbps";
+	} else if (bccomp($bps, '1000000') >= 0) {
+		return bcdiv($bps, '1000000', 2) . " Mbps";
+	} else if (bccomp($bps, '1000') >= 0) {
+		return bcdiv($bps, '1000', 2) . " Kbps";
+	}
+}
+
+function humanSizeToBytes($size)
+{
+	if (preg_match('/^([0-9\.]+)\s*([A-Za-z]+)$/', $size, $m)) {
+	    $num = $m[1];
+	    $size_abbrev = $m[2];
+
+	    switch ($size_abbrev) {
+			case 'B':
+			case 'Bytes':
+			case 'Bps':
+				return $num;
+			case 'KBps':
+			case 'KB':
+			case 'KiB':
+			case 'kB':
+			case 'Kilobytes':
+				return $num * 1000;
+			case 'MiB':
+			case 'MBps':
+			case 'MB':
+			case 'Megabytes':
+				return $num * 1000 * 1000;
+			case 'GB':
+			case 'GiB':
+			case 'GBps':
+			case 'Gigabytes':
+				return $num * 1000 * 1000 * 1000;
+			case 'TB':
+			case 'Terabytes':
+				return $num * 1000 * 1000 * 1000 * 1000;
+			case 'b':
+			case 'bits':
+			case 'bps':
+				return $num/8;
+			case 'Kb':
+			case 'Kbps':
+			case 'kb':
+			case 'kbit':
+			case 'Kilobits':
+				return $num/8 * 1000;
+			case 'm':
+			case 'M':
+			case 'Mb':
+			case 'Mbps':
+			case 'Mbit':
+			case 'Megabits':
+				return $num/8 * 1000 * 1000;
+			case 'Gb':
+			case 'Gbit':
+			case 'Gbps':
+			case 'Gigabits':
+				return $num/8 * 1000 * 1000 * 1000;
+			case 'Tb':
+			case 'Tbps':
+			case 'Tbit':
+			case 'Terabits':
+				return $num/8 * 1000 * 1000 * 1000 * 1000;
+	    }
+
+		return $num;
+	} else {
+		return preg_replace('/[^\-0-9\.]/', '', $size);
+	}
+}
+
+function usage()
+{
+	die(
+		"usage: " . basename($_SERVER['argv'][0]) . "\n" .
+		"\t-a <ip>\n" .
+		"\t-c <snmp community>\n" .
+		"\t-x <snmp iface index>\n" .
+		"\t[-l use low-speed snmp counters]\n" .
+		"\t[-i interval, default 1]\n" .
+		"\t[-r /path/to/rrd/storage/dir]\n" .
+		"\t[-t min-print-threshold (i.e. '5 Mbps')]\n" .
+		"\t[-p address to ping along side utilization]\n" .
+		"\t[-v snmp version (default 2c)]\n\n" .
+		"author: sean kennedy <sean@kndy.net>\n"
+	);
+}
+
