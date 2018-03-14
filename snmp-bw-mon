@@ -173,7 +173,7 @@ for ($i = 0; true; $i++) {
 			
 			$gc = $graphColors;
 			
-			$cmd = "rrdtool graph $rrdDir/" . basename($rrdFile, '.rrd') . "-$timeline.png -c CANVAS#000000 -c FONT#FFFFFF -c BACK#000000 --width 650 --height 400 --border 0 --start now-$days ";
+			$cmd = "rrdtool graph $rrdDir/" . basename($rrdFile, '.rrd') . "-$timeline.png -c CANVAS#000000 -c FONT#FFFFFF -c BACK#000000 --width 650 --height 400 --start now-$days ";
 			if ($pingHost) {
 				$cmd .= "-t \"in/out utilization for $ip, ifidx $ifIdx - RTT to $pingHost\" ";
 				$cmd .= "-v \"msec\" ";
